@@ -1,0 +1,276 @@
+#!/bin/sh -
+
+CMD=`basename $0`
+CWD="`cd ${0%/*};pwd`"
+NUM=5
+RIAK_ROOT=${RIAK_ROOT:-/opt/riak}
+RIAK_VER=`$RIAK_ROOT/CURRENT/bin/riak version 2>/dev/null | sed -e 's/.*(\([^ ]*\) .*$/\1/'`
+RIAK_HOME=$RIAK_ROOT/${RIAK_VER:-1.1.1}
+NETWORK=127.0.0.1
+NODE1_PORT=8098
+NAME="node"
+NODESCRIPT="generate-node.sh"
+
+flim=65536
+while [ "`ulimit -n`" -lt $flim -a $flim -gt 2 ]; do
+  flim=$(($flim / 2))
+  ulimit -n $flim 2>/dev/null
+done
+
+while [ "${1:0:1}" = "-" -a  "${#1}" -gt 1 ]; do
+ case ${1:1} in
+      -version)
+	shift
+	RIAK_FORCE_VER=$1
+	RIAK_VER=$1
+	RIAK_HOME=$RIAK_ROOT/${RIAK_VER:-1.1.1}
+	shift
+	;;
+      c)
+	shift
+	NUM=$1
+	shift
+	if [ ! "$NUM" -gt 0 ]; then
+		echo "Node count $NUM invalid.  Using default of 5"
+		NUM=5
+	fi
+	;;
+      N)
+	shift
+	NAME="$1"
+	shift
+        ;;
+      r)
+        shift
+        RIAK_ROOT="$1"
+	RIAK_VER=${RIAK_FORCE_VER:-`$RIAK_ROOT/CURRENT/bin/riak version | sed -e 's/.*(\([^ ]*\) .*$/\1/'`}
+	RIAK_HOME=$RIAK_ROOT/${RIAK_VER:-1.1.1}
+        shift
+	;;
+      n)
+	shift
+	NETWORK=$1
+	shift
+	;;
+      h)
+	shift
+	NODE1_PORT="$1"
+	HTTP_BASEPORT="$1"
+	shift
+	;;
+      p)
+	shift
+	PB_BASEPORT="$1"
+	shift
+	;;
+      s)
+	shift
+	SNMP_BASEPORT="$1"
+	shift
+	;;
+      b)
+	shift
+	KV_BACKEND="$1"
+	shift
+	;;
+      d)
+	shift
+	HANDOFF_BASEPORT="$1"
+	shift
+	;;
+        *)
+	echo "Unknown flag $1"
+	exit
+	;;
+ esac
+done
+
+if [ -d $RIAK_HOME/${NAME}1 ]; then
+	newcnt=`ls -d $RIAK_HOME/${NAME}[0-9]* | wc -l`
+	if [ ! $newcnt -eq $NUM -a "$1" != "generate" ]; then
+		echo "Found $newcnt nodes in cluster $NAME"
+		NUM=$newcnt
+	fi
+fi
+
+case $1 in
+
+    [0-9]*)
+        $RIAK_HOME/${NAME}$1/bin/riak $2
+        ;;
+
+    each)
+        if [ $# -lt 2 ] || [ "X$2" = "X-h" ]; then
+            echo "Usage: $CMD each <cmd>"
+            exit 1
+        fi
+        for i in `seq 1 $NUM`; do $RIAK_HOME/${NAME}$i/bin/riak $2; done;
+        ;;
+
+    admin)
+        if [ $# -lt 3 ]; then
+            echo "Usage: $CMD admin <node #> <cmd>"
+            exit 1
+        fi
+	node=$2
+	shift 2
+        $RIAK_HOME/${NAME}$node/bin/riak-admin $*
+        ;;
+
+    admin-each)
+        for i in `seq 1 $NUM`; do $RIAK_HOME/${NAME}$i/bin/riak-admin $2; done;
+        ;;
+
+    start|up)
+        for i in `seq 1 $NUM`; do
+            ($RIAK_HOME/${NAME}$i/bin/riak ping | grep 'pong') || $RIAK_HOME/${NAME}$i/bin/riak start && \
+                $RIAK_HOME/${NAME}$i/bin/riak-admin wait-for-service riak_kv ${NAME}$i@$NETWORK
+        done;
+        ;;
+
+    join)
+        for i in `seq 2 $NUM`; do $RIAK_HOME/${NAME}$i/bin/riak-admin join ${NAME}1@$NETWORK; done;
+        ;;
+
+    install-rekon)
+        curl -s rekon.basho.com | node=$NETWORK:$NODE1_PORT sh
+        ;;
+
+    install-riaknostic)
+        (cd /$RIAK_ROOT/CURRENT/${NAME}1/lib && \
+            curl -L https://github.com/basho/riaknostic/downloads/riaknostic-1.0.2.tar.gz | gzcat | tar -xvf -)
+        ;;
+
+    diag|dr|doctor)
+        (cd /opt/riak/CURRENT/${NAME}1/bin && ./riak-admin diag)
+        ;;
+
+    kv)
+        if [ $# -lt 2 ]; then
+            echo "Usage: $CMD kv [bitcask|eleveldb|memory]"
+            exit 1
+        fi
+        for i in `seq 1 $NUM`; do
+            perl -pi -e "s/riak_kv_[a-z]+_backend/riak_kv_$2_backend/" $RIAK_HOME/${NAME}?/etc/app.config
+        done
+        ;;
+
+    data2)
+        rm -rf /Volumes/Media/data
+        for i in `seq 1 $NUM`; do
+            mkdir -p /Volumes/Media/data/${NAME}$i
+            rsync -a /opt/riak/CURRENT/${NAME}$i/data/ /Volumes/Media/data/${NAME}$i
+            mv /opt/riak/CURRENT/${NAME}$i/data /opt/riak/CURRENT/${NAME}$i/data_
+            ln -s /Volumes/Media/data/${NAME}$i /opt/riak/CURRENT/${NAME}$i/data
+        done
+        ;;
+
+    rekon)
+        open http://$NETWORK:$NODE1_PORT/riak/rekon/go
+        ;;
+
+    ready)
+        $RIAK_HOME/${NAME}1/bin/riak-admin ringready
+        ;;
+
+    reset)
+        rm -rf $RIAK_HOME/${NAME}?/data/{kv_vnode,leveldb,bitcask,innostore,wterl,merge_index,mr_queue,ring}
+        rm -f $RIAK_HOME/${NAME}?/log/*
+        ;;
+
+    resize)
+        perl -pi -e "s/{ring_creation_size, $2},/{ring_creation_size, $3},/" $RIAK_HOME/${NAME}?/etc/app.config
+        grep ring_creation_size $RIAK_HOME/${NAME}?/etc/app.config
+        ;;
+
+    console)
+        $RIAK_HOME/${NAME}1/bin/riak console
+        ;;
+
+    ping)
+        for i in `seq 1 $NUM`; do $RIAK_HOME/${NAME}$i/bin/riak ping; done;
+        ;;
+
+    attach)
+        $RIAK_HOME/${NAME}1/bin/riak attach
+        ;;
+
+    stop|down|halt)
+        for i in `seq 1 $NUM`; do $RIAK_HOME/${NAME}$i/bin/riak stop; done;
+        ;;
+
+    info)
+        $RIAK_HOME/${NAME}1/bin/riak-admin cluster_info $RIAK_HOME/`date -u +'%Y-%m-%dT%H:%M:%SZ'`.cluster_info.txt ${NAME}1@$NETWORK
+        ;;
+
+    transfers)
+        $RIAK_HOME/${NAME}1/bin/riak-admin transfers
+        ;;
+
+    member_status)
+        $RIAK_HOME/${NAME}1/bin/riak-admin member_status
+        ;;
+
+    ring_status)
+        $RIAK_HOME/${NAME}1/bin/riak-admin ring_status
+        ;;
+
+    vnode-status|vnode_status)
+        $RIAK_HOME/${NAME}1/bin/riak-admin vnode-status
+        ;;
+
+    force-handoff|force_handoff|force-handoffs|force_handoffs)
+	echo "calling force_handoffs on connected nodes."
+	echo 'rpc:multicall([node() | nodes()], riak_core_vnode_manager, force_handoffs, []).' | $RIAK_HOME/${NAME}1/bin/riak attach > /dev/null 2>&1 || echo "force_handoffs command may not have reached all nodes."
+	;;
+    handoff)
+        #./cluster 'pid=`ps -C beam.smp -o pid=`; if [ $pid ]; then lsof -p $pid | grep ":8099" | grep ESTAB ; fi'
+        #(pid=`ps -C beam.smp -o pid=`; if [ $pid ]; then lsof -p $pid | grep ":8099" | grep ESTAB ; fi)
+        ;;
+
+    stats|stat|status)
+        curl http://$NETWORK:$NODE1_PORT/stats
+        ;;
+
+    search|find)
+        $RIAK_HOME/${NAME}1/bin/search-cmd $@
+        ;;
+
+    generate)
+	if [ -x $RIAK_ROOT/CURRENT/bin/riak ]; then
+		if [ ! -d $RIAK_HOME ]; then
+			echo "Creating $RIAK_HOME"
+			mkdir -p "$RIAK_HOME" || exit
+		fi
+		NODECMD="./$NODESCRIPT"
+		[ -x "$NODECMD" ] || NODECMD="$CWD/$NODESCRIPT"
+		[ -x "$NODECMD" ] || NODECMD="$RIAK_ROOT/$NODESCRIPT"
+		[ -x "$NODECMD" ] || NODECMD="$RIAK_HOME/$NODESCRIPT"
+		if [ -x "$NODECMD" ]; then
+			for i in `seq 1 $NUM`; do 
+				GEN_OPTS=""
+				[ -n "$HTTP_BASEPORT" ] && GEN_OPTS="${GEN_OPTS} -h $(($HTTP_BASEPORT + $i - 1))"
+				[ -n "$PB_BASEPORT" ] && GEN_OPTS="${GEN_OPTS} -p $(($PB_BASEPORT + $i - 1))"
+				[ -n "$HANDOFF_BASEPORT" ] && GEN_OPTS="${GEN_OPTS} -d $(($HANDOFF_BASEPORT + $i - 1))"
+				[ -n "$SNMP_BASEPORT" ] && GEN_OPTS="${GEN_OPTS} -s $(($SNMP_BASEPORT + $i - 1))"
+				[ -n "$KV_BACKEND" ] && GEN_OPTS="${GEN_OPTS} -b ${KV_BACKEND}"
+				echo $NODECMD $GEN_OPTS $RIAK_ROOT/CURRENT/bin/riak $RIAK_HOME/${NAME}$i
+				$NODECMD $GEN_OPTS $RIAK_ROOT/CURRENT/bin/riak $RIAK_HOME/${NAME}$i
+			done
+		else
+			echo "Could not locate $NODESCRIPT"
+		fi
+	else 
+		echo "No riak in $RIAK_ROOT/CURRENT"
+	fi
+	;;
+    destroy)
+        for i in `seq 1 $NUM`; do 
+		$RIAK_HOME/${NAME}$i/bin/riak stop
+		rm -rf $RIAK_HOME/${NAME}$i
+	done;
+	ls -ld $RIAK_HOME/${NAME}[0-9]* 2>/dev/null || echo "Cluster ${NAME} destroyed."
+	;;
+    *) echo "$0: unknown argument: $@";;
+
+esac
